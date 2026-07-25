@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>METAR QC — VNKT</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; background: #0f1115; color: #e6e6e6; }
+  h1 { font-size: 1.3rem; }
+  .raw { font-family: monospace; font-size: 1.1rem; background: #1b1e26; padding: 12px; border-radius: 6px; margin: 12px 0; }
+  .status { display: inline-block; padding: 4px 10px; border-radius: 4px; font-weight: 600; }
+  .ok { background: #1e4620; color: #7be08a; }
+  .fail { background: #4a1e1e; color: #ff8b8b; }
+  .err-item { margin: 8px 0; padding: 8px; background: #241b1b; border-left: 3px solid #ff5c5c; }
+  .ref { color: #999; font-size: 0.85rem; }
+  .sig-item { margin: 8px 0; padding: 8px; background: #2a2410; border-left: 3px solid #ffd83d; }
+  button { background: #2d6cdf; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; }
+  select, input { padding: 6px; margin-right: 8px; }
+  #log { font-size: 0.8rem; color: #888; margin-top: 20px; }
+</style>
+</head>
+<body>
+  <h1>METAR QC Monitor</h1>
+  <div>
+    <label>Station: <input id="station" value="VNKT" style="width:70px; text-transform:uppercase;"></label>
+    <button onclick="checkNow()">Check now</button>
+    <label style="margin-left:12px;"><input type="checkbox" id="autoRefresh" checked> Auto-refresh (60s)</label>
+  </div>
+
+  <div id="result"></div>
+  <div id="log"></div>
+
+<script>
+let audioCtx;
+function playSiren() {
+  audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+  const now = audioCtx.currentTime;
+  for (let i = 0; i < 3; i++) {
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = "sawtooth";
+    osc.frequency.setValueAtTime(600, now + i * 0.6);
+    osc.frequency.linearRampToValueAtTime(1000, now + i * 0.6 + 0.3);
+    osc.frequency.linearRampToValueAtTime(600, now + i * 0.6 + 0.6);
+    gain.gain.setValueAtTime(0.15, now + i * 0.6);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start(now + i * 0.6);
+    osc.stop(now + i * 0.6 + 0.6);
+  }
+}
+
+function log(msg) {
+  const el = document.getElementById("log");
+  el.textContent = new Date().toLocaleTimeString() + " — " + msg + "\n" + el.textContent;
+}
+
+async function checkNow() {
+  const station = document.getElementById("station").value.toUpperCase();
+  const resultDiv = document.getElementById("result");
+  try {
+    const res = await fetch(`/api/check?station=${station}`);
+    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+    const data = await res.json();
+    render(data);
+    if (!data.valid || data.significant.length) playSiren();
+    log(`Checked ${station}: ${data.valid ? "OK" : data.errors.length + " error(s)"}, ${data.significant.length} significant`);
+  } catch (e) {
+    resultDiv.innerHTML = `<div class="status fail">FETCH ERROR</div><p>${e.message}</p>`;
+    log(`Error fetching ${station}: ${e.message}`);
+  }
+}
+
+function render(data) {
+  const resultDiv = document.getElementById("result");
+  let html = `<div class="raw">${data.raw}</div>`;
+  html += `<span class="status ${data.valid ? 'ok' : 'fail'}">${data.valid ? 'VALID' : data.errors.length + ' ERROR(S)'}</span>`;
+  for (const err of data.errors) {
+    html += `<div class="err-item"><strong>${err.id}</strong>: ${err.message}<div class="ref">${err.ref}</div></div>`;
+  }
+  for (const sig of data.significant) {
+    html += `<div class="sig-item">⚠ SIGNIFICANT: <strong>${sig.code}</strong> — ${sig.message}</div>`;
+  }
+  resultDiv.innerHTML = html;
+}
+
+checkNow();
+setInterval(() => { if (document.getElementById("autoRefresh").checked) checkNow(); }, 60000);
+</script>
+</body>
+</html>
