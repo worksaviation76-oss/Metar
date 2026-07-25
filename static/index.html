@@ -2,10 +2,12 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>METAR QC — VNKT</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>METAR QC (GitHub Pages)</title>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; background: #0f1115; color: #e6e6e6; }
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; background: #0f1115; color: #e6e6e6; }
   h1 { font-size: 1.3rem; }
+  textarea { width: 100%; box-sizing: border-box; font-family: monospace; font-size: 1rem; background: #1b1e26; color: #e6e6e6; border: 1px solid #333; border-radius: 6px; padding: 12px; min-height: 60px; }
   .raw { font-family: monospace; font-size: 1.1rem; background: #1b1e26; padding: 12px; border-radius: 6px; margin: 12px 0; }
   .status { display: inline-block; padding: 4px 10px; border-radius: 4px; font-weight: 600; }
   .ok { background: #1e4620; color: #7be08a; }
@@ -13,23 +15,173 @@
   .err-item { margin: 8px 0; padding: 8px; background: #241b1b; border-left: 3px solid #ff5c5c; }
   .ref { color: #999; font-size: 0.85rem; }
   .sig-item { margin: 8px 0; padding: 8px; background: #2a2410; border-left: 3px solid #ffd83d; }
-  button { background: #2d6cdf; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; }
-  select, input { padding: 6px; margin-right: 8px; }
-  #log { font-size: 0.8rem; color: #888; margin-top: 20px; }
+  button { background: #2d6cdf; color: white; border: none; padding: 10px 18px; border-radius: 4px; cursor: pointer; font-size: 1rem; margin-top: 10px; }
+  .note { color: #888; font-size: 0.85rem; margin-top: 24px; border-top: 1px solid #333; padding-top: 12px; }
+  .examples { color: #888; font-size: 0.85rem; margin: 8px 0; }
+  .examples span { cursor: pointer; text-decoration: underline; margin-right: 12px; }
 </style>
 </head>
 <body>
-  <h1>METAR QC Monitor</h1>
-  <div>
-    <label>Station: <input id="station" value="VNKT" style="width:70px; text-transform:uppercase;"></label>
-    <button onclick="checkNow()">Check now</button>
-    <label style="margin-left:12px;"><input type="checkbox" id="autoRefresh" checked> Auto-refresh (60s)</label>
+  <h1>METAR QC — GitHub Pages edition</h1>
+  <p style="color:#999; font-size:0.9rem;">Runs entirely in your browser — no server, no auto-fetch. Paste a raw METAR below and check it.</p>
+
+  <textarea id="rawInput" placeholder="e.g. VNKT 251200Z 27008KT 9999 FEW030 22/12 Q1015 NOSIG"></textarea>
+  <div class="examples">
+    Try: <span onclick="loadExample(0)">valid</span><span onclick="loadExample(1)">bad gust</span><span onclick="loadExample(2)">bad dewpoint</span><span onclick="loadExample(3)">thunderstorm</span><span onclick="loadExample(4)">CAVOK conflict</span>
   </div>
+  <button onclick="checkNow()">Check METAR</button>
 
   <div id="result"></div>
-  <div id="log"></div>
+
+  <div class="note">
+    This is the manual-input counterpart of the full auto-fetching version
+    (Python/FastAPI backend, deployed on Render). Same rule engine and
+    citations, ported to JavaScript so it can run on GitHub Pages with no
+    server. Rules cover: wind, visibility, temperature/dewpoint, QNH,
+    cloud, gust logic, and CAVOK exclusivity — per ICAO Annex 3 App.3 /
+    WMO No. 782. Not yet covering RVR tendency, trend groups, or the full
+    present-weather combination table.
+  </div>
 
 <script>
+// ---- Rule set (ported from rules.py) ----
+const WX_INTENSITY = "[+-]?";
+const WX_DESCRIPTOR = "(MI|BC|PR|DR|BL|SH|TS|FZ)?";
+const WX_PHENOMENA = "(DZ|RA|SN|SG|IC|PL|GR|GS|UP|BR|FG|FU|VA|DU|SA|HZ|PO|SQ|FC|SS|DS)+";
+const WX_GROUP_RE = new RegExp(`^${WX_INTENSITY}${WX_DESCRIPTOR}${WX_PHENOMENA}$|^VC(TS|SH|FG|PO|DS|SS|FC)$`);
+
+const RULES = [
+  {
+    id: "wind_group",
+    ref: "Annex 3 App.3 §4.1 / WMO 782 FM15 Ddd ff Gfmfm",
+    pattern: /^(\d{3}|VRB)(\d{2,3})(G(\d{2,3}))?(KT|MPS)$/,
+    required: true,
+    message: "wind group missing or malformed — expected dddffGfmfmKT/MPS (e.g. 27008G18KT)",
+  },
+  {
+    id: "visibility_group",
+    ref: "Annex 3 App.3 §4.3",
+    pattern: /^(CAVOK|\d{4}|\/\/\/\/|\d{1,2}SM)$/,
+    required: true,
+    message: "visibility group missing/malformed — expected 4-digit metres or CAVOK",
+  },
+  {
+    id: "temp_dewpoint_group",
+    ref: "Annex 3 App.3 §4.7",
+    pattern: /^(M?\d{2})\/(M?\d{2})$/,
+    required: true,
+    message: "temperature/dewpoint group missing/malformed — expected TT/TdTd (e.g. 18/12 or M02/M05)",
+  },
+  {
+    id: "qnh_group",
+    ref: "Annex 3 App.3 §4.8",
+    pattern: /^Q(\d{4})$|^A(\d{4})$/,
+    required: true,
+    message: "QNH group missing/malformed — expected Qpppp (hPa) or Apppp (inHg)",
+  },
+  {
+    id: "cloud_group",
+    ref: "Annex 3 App.3 §4.5",
+    pattern: /^(FEW|SCT|BKN|OVC)\d{3}(CB|TCU)?$|^(NSC|NCD|VV\d{3}|VV\/\/\/)$/,
+    required: false,
+  },
+];
+
+const SIGNIFICANT_WX_CODES = {
+  "TS": "Thunderstorm",
+  "+TSRA": "Heavy thunderstorm with rain",
+  "GR": "Hail",
+  "FC": "Funnel cloud / tornado",
+  "SS": "Sandstorm",
+  "DS": "Duststorm",
+  "VA": "Volcanic ash",
+  "SQ": "Squall",
+};
+
+function findGroup(tokens, pattern) {
+  for (const t of tokens) {
+    const m = t.match(pattern);
+    if (m) return { token: t, match: m };
+  }
+  return { token: null, match: null };
+}
+
+function validate(raw) {
+  const tokens = raw.trim().split(/\s+/);
+  const errors = [];
+  const significant = [];
+  const isCavok = tokens.includes("CAVOK");
+  const matches = {};
+
+  for (const rule of RULES) {
+    const { match } = findGroup(tokens, rule.pattern);
+    matches[rule.id] = match;
+    const skipBecauseCavok = rule.id === "cloud_group" && isCavok;
+    if (rule.required && !match && !skipBecauseCavok) {
+      errors.push({ id: rule.id, ref: rule.ref, message: rule.message });
+    }
+  }
+
+  // gust logic
+  const windM = matches["wind_group"];
+  if (windM && windM[4]) {
+    const spd = parseInt(windM[2], 10);
+    const gust = parseInt(windM[4], 10);
+    if (gust <= spd) {
+      errors.push({
+        id: "wind_gust_logic",
+        ref: "WMO 782 — gust must exceed mean speed",
+        message: `gust (${gust}) is not greater than mean wind speed (${spd})`,
+      });
+    }
+  }
+
+  // temp >= dewpoint
+  const tdM = matches["temp_dewpoint_group"];
+  if (tdM) {
+    const toC = (s) => (s.startsWith("M") ? -parseInt(s.slice(1), 10) : parseInt(s, 10));
+    const t = toC(tdM[1]);
+    const td = toC(tdM[2]);
+    if (td > t) {
+      errors.push({
+        id: "temp_ge_dewpoint",
+        ref: "Physical constraint — dewpoint cannot exceed air temperature",
+        message: `dewpoint (${td}C) exceeds air temperature (${t}C)`,
+      });
+    }
+  }
+
+  // CAVOK exclusivity
+  if (isCavok) {
+    const cloudPresent = tokens.some((t) => t !== "CAVOK" && RULES.find((r) => r.id === "cloud_group").pattern.test(t));
+    const wxPresent = tokens.some((t) => WX_GROUP_RE.test(t));
+    if (cloudPresent || wxPresent) {
+      errors.push({
+        id: "cavok_excludes_cloud_wx",
+        ref: "Annex 3 App.3 §4.3",
+        message: "CAVOK reported alongside cloud and/or weather groups — mutually exclusive",
+      });
+    }
+  }
+
+  // significant weather scan
+  for (const t of tokens) {
+    if (WX_GROUP_RE.test(t)) {
+      for (const [code, label] of Object.entries(SIGNIFICANT_WX_CODES)) {
+        if (t.includes(code.replace("+", ""))) {
+          significant.push({ code, message: `${label} reported` });
+        }
+      }
+    }
+    if (t === "WS" || t.startsWith("WS")) {
+      significant.push({ code: t, message: "Wind shear reported" });
+    }
+  }
+
+  return { raw, valid: errors.length === 0, errors, significant };
+}
+
+// ---- Siren (Web Audio API) ----
 let audioCtx;
 function playSiren() {
   audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
@@ -48,31 +200,10 @@ function playSiren() {
   }
 }
 
-function log(msg) {
-  const el = document.getElementById("log");
-  el.textContent = new Date().toLocaleTimeString() + " — " + msg + "\n" + el.textContent;
-}
-
-async function checkNow() {
-  const station = document.getElementById("station").value.toUpperCase();
-  const resultDiv = document.getElementById("result");
-  try {
-    const res = await fetch(`/api/check?station=${station}`);
-    if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
-    const data = await res.json();
-    render(data);
-    if (!data.valid || data.significant.length) playSiren();
-    log(`Checked ${station}: ${data.valid ? "OK" : data.errors.length + " error(s)"}, ${data.significant.length} significant`);
-  } catch (e) {
-    resultDiv.innerHTML = `<div class="status fail">FETCH ERROR</div><p>${e.message}</p>`;
-    log(`Error fetching ${station}: ${e.message}`);
-  }
-}
-
 function render(data) {
   const resultDiv = document.getElementById("result");
   let html = `<div class="raw">${data.raw}</div>`;
-  html += `<span class="status ${data.valid ? 'ok' : 'fail'}">${data.valid ? 'VALID' : data.errors.length + ' ERROR(S)'}</span>`;
+  html += `<span class="status ${data.valid ? "ok" : "fail"}">${data.valid ? "VALID" : data.errors.length + " ERROR(S)"}</span>`;
   for (const err of data.errors) {
     html += `<div class="err-item"><strong>${err.id}</strong>: ${err.message}<div class="ref">${err.ref}</div></div>`;
   }
@@ -82,8 +213,25 @@ function render(data) {
   resultDiv.innerHTML = html;
 }
 
-checkNow();
-setInterval(() => { if (document.getElementById("autoRefresh").checked) checkNow(); }, 60000);
+function checkNow() {
+  const raw = document.getElementById("rawInput").value;
+  if (!raw.trim()) return;
+  const data = validate(raw);
+  render(data);
+  if (!data.valid || data.significant.length) playSiren();
+}
+
+const EXAMPLES = [
+  "VNKT 251200Z 27008KT 9999 FEW030 22/12 Q1015 NOSIG",
+  "VNKT 251200Z 27008G05KT 9999 FEW030 22/12 Q1015",
+  "VNKT 251200Z 27008KT 9999 FEW030 12/22 Q1015",
+  "VNKT 251200Z 27015G28KT 3000 +TSRA BKN010CB 24/23 Q1008",
+  "VNKT 251200Z 27008KT CAVOK BKN020 22/12 Q1015",
+];
+function loadExample(i) {
+  document.getElementById("rawInput").value = EXAMPLES[i];
+  checkNow();
+}
 </script>
 </body>
 </html>
